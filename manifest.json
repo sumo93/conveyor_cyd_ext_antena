@@ -1,28 +1,13 @@
 {
-    "name": "Conveyor Display",
-    "version": "87.0",
-    "new_install_prompt_erase": true,
-    "builds": [
-        {
-            "chipFamily": "ESP32",
-            "parts": [
-                {
-                    "path": "dopravnik_displej_extantena.ino.bootloader.bin",
-                    "offset": 4096
-                },
-                {
-                    "path": "dopravnik_displej_extantena.ino.partitions.bin",
-                    "offset": 32768
-                },
-                {
-                    "path": "boot_app0.bin",
-                    "offset": 57344
-                },
-                {
-                    "path": "dopravnik_displej_extantena.ino.bin",
-                    "offset": 65536
-                }
-            ]
-        }
-    ]
+  "name": "Conveyor Display",
+  "version": "87.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "dopravnik_displej_extantena.ino.merged.bin", "offset": 0 }
+      ]
+    }
+  ]
 }

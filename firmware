@@ -1,0 +1,813 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h> 
+#include <XPT2046_Touchscreen.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// =================================================================================
+// === 1. KONFIGURACE BAREV A PINŮ ===
+// =================================================================================
+
+#define ANDROID_BG      0x1082  
+#define UI_CARD_BG      0x2124  
+#define UI_TEXT_MAIN    0xFFFF  
+#define UI_TEXT_SUB     0x9CD3  
+#define ANDROID_ACCENT  0x04D9  
+#define ANDROID_KEY     0x39E7  
+#define ANDROID_KEY_P   0x2104  
+#define ANDROID_DEL     0x9104  
+#define RING_TRACK      0x3186  
+
+#define ANDROID_TEXT    0xFFFF  
+#define ANDROID_SUB     0x9CD3  
+#define UI_BG           0x1082  
+#define UI_ACCENT       0x4416  
+
+uint16_t palette[] = { 0xF800, 0x05E0, 0x04FF, 0xFFE0, 0x07FF, 0xF81F, 0xFFFF, 0x0000 };
+int palette_len = 8;
+
+#define RELAY_ACTIVE_LOW  true 
+#if RELAY_ACTIVE_LOW
+  #define RELAY_ON  LOW
+  #define RELAY_OFF HIGH
+#else
+  #define RELAY_ON  HIGH
+  #define RELAY_OFF LOW
+#endif
+
+// PINY PRO ESP32-2432S028 bez TPM408 (ESP-32S)
+#define RELAY1_PIN     22  
+#define RELAY2_PIN     27  
+#define CYD_BACKLIGHT  21 
+
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+SPIClass touchSpi = SPIClass(HSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+TFT_eSPI tft = TFT_eSPI(); 
+
+Preferences preferences;
+
+// =================================================================================
+// === 2. DATA A STRUKTURY ===
+// =================================================================================
+
+struct Printer {
+  String name; String ip; String accessCode; String serial;
+  int runTimeSec; 
+  int delayStartSec;
+  int poopTarget;
+  int poopCounter;
+  bool useM1; bool useM2;
+  
+  volatile int status;      
+  volatile int sub_status;  
+  
+  String statusText; String mqttStatus; uint16_t color; int progress; bool configValid;   
+  bool poop_triggered; 
+  unsigned long lastTriggerTime;
+  unsigned long msg_count; 
+  
+  String last_statusText; String last_mqttStatus; uint16_t last_color; String last_name; 
+  int last_progress; int last_status_id; int last_conveyor_state_id; int last_msg_count; int last_poop_counter;
+};
+
+Printer printers[4]; 
+
+String wifi_ssid = "";
+String wifi_pass = "";
+int default_delay_start = 120; 
+int delay_m2_sec = 5; int duration_m2_sec = 5; bool m2_auto_link = false; 
+int sleep_timeout = 60; bool sleep_in_minutes = false; 
+unsigned long last_interaction = 0; bool is_screen_off = false;
+int idx_col_ok = 1; int idx_col_err = 0; int idx_col_act = 2;  
+volatile int currentMqttIndex = 0; TaskHandle_t NetworkTask; unsigned long lastWifiCheck = 0; bool lastWifiConnected = false;
+
+enum ConveyorState { STATE_IDLE, STATE_WAITING_TO_START, STATE_RUNNING }; 
+volatile ConveyorState conveyorState = STATE_IDLE;
+unsigned long detectionTime = 0; unsigned long runStartTime = 0; int targetTimeM1_ms = 5000; int activePrinterIndex = -1;       
+
+WiFiClientSecure netClient; 
+PubSubClient mqtt(netClient);
+
+enum ScreenState { SCREEN_MAIN, SCREEN_MENU_HUB, SCREEN_SETUP_NETWORK, SCREEN_SETUP_MOTORS, SCREEN_SETUP_COLORS, SCREEN_SETUP_DISPLAY, SCREEN_PRINTER_SETTINGS, SCREEN_KEYBOARD };
+ScreenState currentScreen = SCREEN_MAIN;
+int editingPrinterIndex = 0; 
+
+String keyboardTitle = ""; String* keyboardTargetVariable = nullptr; int* keyboardTargetInt = nullptr; String keyboardBuffer = ""; int keyboardMode = 0; 
+
+int ts_x1 = 200; int ts_y1 = 200; int ts_x2 = 3800; int ts_y2 = 3800; bool is_calibrated = false;
+
+// STANDARDNÍ KLÁVESNICE
+const char* keysLower[4][10] = {{"1","2","3","4","5","6","7","8","9","0"},{"q","w","e","r","t","y","u","i","o","p"},{"a","s","d","f","g","h","j","k","l","@"},{"z","x","c","v","b","n","m",".",",","-"}};
+const char* keysUpper[4][10] = {{"1","2","3","4","5","6","7","8","9","0"},{"Q","W","E","R","T","Y","U","I","O","P"},{"A","S","D","F","G","H","J","K","L","@"},{"Z","X","C","V","B","N","M",".",",","-"}};
+const char* keysSym[4][10] = {{"1","2","3","4","5","6","7","8","9","0"},{"!","@","#","$","%","^","&","*","(",")"},{"-","_","=","+","[","]","{","}",";",":"},{"<",">","?","/","|","`","~","\\","'","\""}};
+
+// =================================================================================
+// === 3. DEKLARACE ===
+// =================================================================================
+
+void checkConveyorLogic(); 
+void checkSleep();
+void updatePrinterBox(int index);
+void forceUpdateAllBoxes();
+void drawMainScreen(); 
+void drawMenuHub(); 
+void drawSetupNetwork(); 
+void drawSetupMotors(); 
+void drawSetupColors(); 
+void drawSetupDisplay(); 
+void drawPrinterSettings(int index); 
+void drawKeyboard(bool fullRedraw); 
+void openKeyboard(String &var, String title);
+void openNumKeyboard(int &var, String title);
+void runCalibrationProcedure();
+void savePreferences();
+void saveM2Link();
+void forceRefreshMQTT(int index);
+bool isTouched(int &x, int &y); 
+void drawBtn(int x, int y, int w, int h, const String &label, uint16_t color, uint16_t txtColor); 
+void drawBtn(int x, int y, int w, int h, const String &label, uint16_t color);
+void drawProgressRing(int x, int y, int radius, int percent, uint16_t color);
+void handleTouch(int x, int y);
+void handleKeyboardInput(int x, int y);
+void networkLoop(void * parameter);
+
+// =================================================================================
+// === 4. UI HELPERY ===
+// =================================================================================
+
+void drawBtn(int x, int y, int w, int h, const String &label, uint16_t color, uint16_t txtColor) {
+  tft.fillRoundRect(x+2, y+2, w, h, 6, 0x0000); 
+  tft.fillRoundRect(x, y, w, h, 6, color); 
+  tft.drawRoundRect(x, y, w, h, 6, UI_BG); 
+  tft.setTextColor(txtColor, color); 
+  tft.setTextDatum(MC_DATUM); 
+  tft.drawString(label, x + w/2, y + h/2, 2); 
+  tft.setTextDatum(TL_DATUM); 
+}
+
+void drawBtn(int x, int y, int w, int h, const String &label, uint16_t color) { 
+  drawBtn(x, y, w, h, label, color, UI_TEXT_MAIN); 
+}
+
+void drawProgressRing(int x, int y, int radius, int percent, uint16_t color) {
+  tft.drawCircle(x, y, radius, RING_TRACK); 
+  tft.drawCircle(x, y, radius-1, RING_TRACK); 
+  tft.fillCircle(x, y, radius-2, UI_CARD_BG);
+
+  int angle = (percent * 360) / 100;
+  for (int i = 0; i < angle; i+=3) { 
+      float rad = (i - 90) * 0.0174532925;
+      int x1 = x + cos(rad) * radius;
+      int y1 = y + sin(rad) * radius;
+      int x2 = x + cos(rad) * (radius-1);
+      int y2 = y + sin(rad) * (radius-1);
+      tft.drawPixel(x1, y1, color);
+      tft.drawPixel(x2, y2, color);
+  }
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, UI_CARD_BG); 
+  tft.drawString(String(percent) + "%", x, y + 1, 1); 
+}
+
+void updateWifiStatusUI() {
+  if (currentScreen != SCREEN_MAIN) return;
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected != lastWifiConnected) { tft.fillCircle(145, 17, 5, connected ? palette[1] : palette[0]); lastWifiConnected = connected; }
+}
+
+void loadPreferences() {
+  preferences.begin("cyd-v60", false); 
+  wifi_ssid = preferences.getString("ssid", ""); 
+  wifi_pass = preferences.getString("pass", "");
+  
+  default_delay_start = preferences.getInt("d_start", 120); 
+  delay_m2_sec = preferences.getInt("del_m2", 5); duration_m2_sec = preferences.getInt("dur_m2", 5);
+  idx_col_ok = preferences.getInt("c_ok", 1); idx_col_err = preferences.getInt("c_err", 0); idx_col_act = preferences.getInt("c_act", 2);
+  sleep_timeout = preferences.getInt("slp_t", 60); sleep_in_minutes = preferences.getBool("slp_m", false); m2_auto_link = preferences.getBool("m2_lnk", false); 
+  
+  for (int i=0; i<4; i++) {
+    String p = String(i);
+    String defIP = ""; String defSN = ""; String defAC = "";
+    
+    printers[i].name = preferences.getString(("nm"+p).c_str(), "Printer " + String(i+1));
+    printers[i].ip = preferences.getString(("ip"+p).c_str(), defIP);
+    printers[i].accessCode = preferences.getString(("ac"+p).c_str(), defAC);
+    printers[i].serial = preferences.getString(("sn"+p).c_str(), defSN);
+    printers[i].runTimeSec = preferences.getInt(("rt"+p).c_str(), 5);
+    printers[i].delayStartSec = preferences.getInt(("ds"+p).c_str(), 120); 
+    printers[i].poopTarget = preferences.getInt(("pt"+p).c_str(), 1);
+    
+    printers[i].poopCounter = preferences.getInt(("pc"+p).c_str(), 0);
+    
+    printers[i].useM1 = preferences.getBool(("uR1"+p).c_str(), true); printers[i].useM2 = preferences.getBool(("uR2"+p).c_str(), true);
+    printers[i].status = -1; printers[i].sub_status = -1; 
+    printers[i].statusText = "OFFLINE"; printers[i].mqttStatus = "--"; printers[i].color = palette[idx_col_err]; 
+    printers[i].configValid = (printers[i].ip.length() > 5); printers[i].progress = 0; printers[i].last_statusText = ""; 
+    printers[i].poop_triggered = false; printers[i].lastTriggerTime = 0; printers[i].msg_count = 0;
+    printers[i].last_conveyor_state_id = -1; printers[i].last_msg_count = 0;
+    printers[i].last_poop_counter = -1;
+  }
+  preferences.end();
+}
+
+void saveM2Link() { if (preferences.begin("cyd-v60", false)) { preferences.putBool("m2_lnk", m2_auto_link); preferences.end(); } }
+
+void savePreferences() {
+  if (!preferences.begin("cyd-v60", false)) return;
+  preferences.putString("ssid", wifi_ssid); preferences.putString("pass", wifi_pass);
+  preferences.putInt("d_start", default_delay_start); preferences.putInt("del_m2", delay_m2_sec); preferences.putInt("dur_m2", duration_m2_sec);
+  preferences.putInt("c_ok", idx_col_ok); preferences.putInt("c_err", idx_col_err); preferences.putInt("c_act", idx_col_act);
+  preferences.putInt("slp_t", sleep_timeout); preferences.putBool("slp_m", sleep_in_minutes); preferences.putBool("m2_lnk", m2_auto_link); 
+  for (int i=0; i<4; i++) {
+    String p = String(i);
+    preferences.putString(("nm"+p).c_str(), printers[i].name); preferences.putString(("ip"+p).c_str(), printers[i].ip);
+    preferences.putString(("ac"+p).c_str(), printers[i].accessCode); preferences.putString(("sn"+p).c_str(), printers[i].serial);
+    preferences.putInt(("rt"+p).c_str(), printers[i].runTimeSec); 
+    preferences.putInt(("ds"+p).c_str(), printers[i].delayStartSec);
+    preferences.putInt(("pt"+p).c_str(), printers[i].poopTarget);
+    preferences.putBool(("uR1"+p).c_str(), printers[i].useM1); preferences.putBool(("uR2"+p).c_str(), printers[i].useM2);
+    printers[i].configValid = (printers[i].ip.length() > 5);
+  }
+  preferences.end();
+}
+
+void saveCalibration() { 
+  preferences.begin("cyd-calib", false); 
+  preferences.putInt("x1", ts_x1); preferences.putInt("y1", ts_y1); 
+  preferences.putInt("x2", ts_x2); preferences.putInt("y2", ts_y2); 
+  preferences.putBool("calibrated", true); 
+  preferences.end(); 
+}
+
+void loadCalibration() { 
+  preferences.begin("cyd-calib", false); 
+  is_calibrated = preferences.getBool("calibrated", false); 
+  if (is_calibrated) { 
+    ts_x1 = preferences.getInt("x1", 200); ts_y1 = preferences.getInt("y1", 200); 
+    ts_x2 = preferences.getInt("x2", 3800); ts_y2 = preferences.getInt("y2", 3800); 
+  } 
+  preferences.end(); 
+}
+
+void runCalibrationProcedure() { 
+  tft.setTextSize(1); tft.fillScreen(TFT_BLACK); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(2); 
+  tft.setCursor(20, 100); tft.print("CLICK TOP-LEFT"); delay(500); tft.fillCircle(10, 10, 5, TFT_RED); 
+  while (!ts.touched()) delay(10); TS_Point p1 = ts.getPoint(); while (ts.touched()) delay(10); 
+  ts_x1 = p1.x; ts_y1 = p1.y; 
+  tft.fillScreen(TFT_BLACK); tft.setCursor(20, 100); tft.print("CLICK BOT-RIGHT"); delay(500); tft.fillCircle(310, 230, 5, TFT_RED); 
+  while (!ts.touched()) delay(10); TS_Point p2 = ts.getPoint(); while (ts.touched()) delay(10); 
+  ts_x2 = p2.x; ts_y2 = p2.y; 
+  saveCalibration(); tft.fillScreen(TFT_GREEN); delay(500); 
+}
+
+bool isTouched(int &x, int &y) {
+  if (ts.touched()) { 
+    TS_Point p = ts.getPoint(); 
+    if (ts_x1 == ts_x2) ts_x2 = ts_x1 + 1; 
+    if (ts_y1 == ts_y2) ts_y2 = ts_y1 + 1;
+    x = map(p.x, ts_x1, ts_x2, 0, 320); y = map(p.y, ts_y1, ts_y2, 0, 240); 
+    if (x < 0) x = 0; if (x > 320) x = 320; if (y < 0) y = 0; if (y > 240) y = 240; 
+    return true; 
+  } 
+  return false;
+}
+
+// =================================================================================
+// === 5. MQTT ===
+// =================================================================================
+
+void forceRefreshMQTT(int index) {
+  if (WiFi.status() == WL_CONNECTED && printers[index].configValid) {
+    char pub_topic[100]; sprintf(pub_topic, "device/%s/request", printers[index].serial.c_str()); 
+    if (mqtt.connected()) { mqtt.publish(pub_topic, "{\"pushing\":{\"sequence_id\":\"1\",\"command\":\"pushall\"},\"user_id\":\"1\"}"); Serial.println("Force Refresh Sent!"); }
+  }
+}
+
+int findIntInPayload(byte* payload, unsigned int length, const char* key) {
+  int keyLen = strlen(key);
+  for (unsigned int i = 0; i < length - keyLen; i++) {
+    bool match = true;
+    for (int k = 0; k < keyLen; k++) {
+      if ((char)payload[i+k] != key[k]) { match = false; break; }
+    }
+    if (match) {
+      int valStart = i + keyLen;
+      while(valStart < length && ((char)payload[valStart] == ' ' || (char)payload[valStart] == ':')) valStart++;
+      String numStr = "";
+      while(valStart < length && isDigit((char)payload[valStart])) {
+        numStr += (char)payload[valStart]; valStart++;
+      }
+      if (numStr.length() > 0) return numStr.toInt();
+    }
+  }
+  return -1; 
+}
+
+void mqttGlobalCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic); int foundIndex = -1;
+  for(int i=0; i<4; i++) { if (printers[i].configValid && t.indexOf(printers[i].serial) >= 0) { foundIndex = i; break; } }
+  if (foundIndex == -1) return; 
+  
+  printers[foundIndex].msg_count++;
+
+  int raw_stage = findIntInPayload(payload, length, "\"stg_cur\"");
+  int raw_sub_stage = findIntInPayload(payload, length, "\"mc_print_sub_stage\"");
+  int raw_progress = findIntInPayload(payload, length, "\"mc_percent\"");
+  
+  if (raw_progress != -1) printers[foundIndex].progress = raw_progress;
+  if (raw_sub_stage != -1) printers[foundIndex].sub_status = raw_sub_stage;
+
+  if (raw_stage != -1) {
+    printers[foundIndex].status = raw_stage;
+    
+    if (raw_stage == 4 || raw_stage == 14 || (raw_sub_stage == 4 && raw_stage != -1)) { 
+       printers[foundIndex].statusText = "POOP!"; printers[foundIndex].color = palette[idx_col_act];
+       
+       if (conveyorState == STATE_IDLE) { 
+          unsigned long now = millis();
+          if (now - printers[foundIndex].lastTriggerTime > 90000) {
+             printers[foundIndex].poopCounter++;
+             printers[foundIndex].lastTriggerTime = now; 
+             
+             preferences.begin("cyd-v60", false);
+             preferences.putInt(("pc"+String(foundIndex)).c_str(), printers[foundIndex].poopCounter);
+             preferences.end();
+
+             if (printers[foundIndex].poopCounter >= printers[foundIndex].poopTarget) {
+                 activePrinterIndex = foundIndex; 
+                 targetTimeM1_ms = printers[foundIndex].runTimeSec * 1000; 
+                 detectionTime = millis(); 
+                 conveyorState = STATE_WAITING_TO_START; 
+                 printers[foundIndex].poopCounter = 0; 
+                 
+                 preferences.begin("cyd-v60", false);
+                 preferences.putInt(("pc"+String(foundIndex)).c_str(), 0);
+                 preferences.end();
+             }
+          }
+       }
+    } else {
+       if (raw_stage >= 6 && raw_stage <= 30) { printers[foundIndex].statusText = "PRINTING"; printers[foundIndex].color = palette[idx_col_ok]; } 
+       else { printers[foundIndex].statusText = "READY"; printers[foundIndex].color = palette[idx_col_ok]; }
+    }
+    return;
+  }
+}
+
+void networkLoop(void * parameter) {
+  netClient.setInsecure(); 
+  mqtt.setBufferSize(40000); 
+  mqtt.setCallback(mqttGlobalCallback); 
+  unsigned long lastPushTime = 0;
+  
+  unsigned long connectionStart = 0;
+  const unsigned long ROTATION_INTERVAL = 5000; 
+
+  for(;;) { 
+    if (wifi_ssid.length() > 2) { if (WiFi.status() != WL_CONNECTED) { WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); unsigned long startW = millis(); while (WiFi.status() != WL_CONNECTED && millis() - startW < 5000) vTaskDelay(100); } }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Printer &p = printers[currentMqttIndex];
+      
+      if (!p.configValid) { 
+         p.statusText = "SETUP"; p.color = UI_CARD_BG; 
+         currentMqttIndex++; if (currentMqttIndex >= 4) currentMqttIndex = 0; 
+         vTaskDelay(50); continue; 
+      }
+
+      mqtt.setServer(p.ip.c_str(), 8883);
+      if (!mqtt.connected()) {
+        if (mqtt.connect("CYD_Scanner", "bblp", p.accessCode.c_str())) {
+           p.mqttStatus = "OK"; 
+           connectionStart = millis(); 
+           char topic[100]; sprintf(topic, "device/%s/report", p.serial.c_str()); mqtt.subscribe(topic);
+           char pub_topic[100]; sprintf(pub_topic, "device/%s/request", p.serial.c_str()); mqtt.publish(pub_topic, "{\"pushing\":{\"sequence_id\":\"1\",\"command\":\"pushall\"},\"user_id\":\"1\"}");
+        } else {
+           p.mqttStatus = "ERR"; p.statusText = "OFFLINE"; p.color = palette[idx_col_err]; p.status = -1;
+           currentMqttIndex++; if (currentMqttIndex >= 4) currentMqttIndex = 0; 
+           vTaskDelay(1000); continue; 
+        }
+      }
+
+      while(mqtt.connected()) {
+         mqtt.loop(); 
+         
+         if (millis() - lastPushTime > 5000) {
+            char pub_topic[100]; sprintf(pub_topic, "device/%s/request", p.serial.c_str()); 
+            mqtt.publish(pub_topic, "{\"pushing\":{\"sequence_id\":\"1\",\"command\":\"pushall\"},\"user_id\":\"1\"}");
+            lastPushTime = millis();
+         }
+         
+         if (millis() - connectionStart > ROTATION_INTERVAL) {
+             mqtt.disconnect(); 
+             currentMqttIndex++; if (currentMqttIndex >= 4) currentMqttIndex = 0;
+             break; 
+         }
+
+         vTaskDelay(5); 
+      }
+    } else { vTaskDelay(1000); }
+  }
+}
+
+// =================================================================================
+// === 6. LOGIKA PÁSU A NAPÁJENÍ ===
+// =================================================================================
+
+void checkConveyorLogic() {
+  if (currentScreen != SCREEN_MAIN) return; 
+  unsigned long now = millis();
+  
+  unsigned long delay_start_ms = 2000;
+  if (activePrinterIndex >= 0) {
+      delay_start_ms = printers[activePrinterIndex].delayStartSec * 1000;
+  }
+
+  unsigned long delay_m2_ms = delay_m2_sec * 1000; unsigned long duration_m2_ms = duration_m2_sec * 1000; 
+  
+  if (conveyorState == STATE_WAITING_TO_START) { if (now - detectionTime > delay_start_ms) { runStartTime = now; conveyorState = STATE_RUNNING; if (activePrinterIndex >= 0 && printers[activePrinterIndex].useM1) digitalWrite(RELAY1_PIN, RELAY_ON); } }
+  if (conveyorState == STATE_RUNNING) {
+    unsigned long runningTime = now - runStartTime; bool anyRun = false;
+    if (activePrinterIndex >= 0) {
+       if (printers[activePrinterIndex].useM1) { if (runningTime < targetTimeM1_ms) anyRun = true; else digitalWrite(RELAY1_PIN, RELAY_OFF); } else digitalWrite(RELAY1_PIN, RELAY_OFF);
+       if (printers[activePrinterIndex].useM2 && m2_auto_link) { if (runningTime > delay_m2_ms && runningTime < (delay_m2_ms + duration_m2_ms)) { digitalWrite(RELAY2_PIN, RELAY_ON); anyRun = true; } else { digitalWrite(RELAY2_PIN, RELAY_OFF); if (runningTime < delay_m2_ms) anyRun = true; } } else digitalWrite(RELAY2_PIN, RELAY_OFF);
+    }
+    if (!anyRun) { digitalWrite(RELAY1_PIN, RELAY_OFF); digitalWrite(RELAY2_PIN, RELAY_OFF); int finishedIndex = activePrinterIndex; conveyorState = STATE_IDLE; activePrinterIndex = -1; if(finishedIndex >= 0) { printers[finishedIndex].last_statusText = ""; updatePrinterBox(finishedIndex); } }
+  }
+}
+
+void checkSleep() {
+  unsigned long timeout_ms = (unsigned long)sleep_timeout * (sleep_in_minutes ? 60000 : 1000);
+  if (sleep_timeout > 0 && millis() - last_interaction > timeout_ms) { if (!is_screen_off) { digitalWrite(CYD_BACKLIGHT, LOW); is_screen_off = true; } } else { if (is_screen_off) { digitalWrite(CYD_BACKLIGHT, HIGH); is_screen_off = false; } }
+}
+
+// =================================================================================
+// === 7. KRESLENÍ A OVLÁDÁNÍ (UI) ===
+// =================================================================================
+
+void updatePrinterBox(int index) {
+  if (currentScreen != SCREEN_MAIN) return;
+  Printer &p = printers[index];
+  
+  int currentConveyorState = (activePrinterIndex == index) ? conveyorState : -1;
+  
+  if (p.statusText == p.last_statusText && 
+      p.mqttStatus == p.last_mqttStatus && 
+      p.color == p.last_color && 
+      p.name == p.last_name && 
+      p.progress == p.last_progress &&
+      p.last_conveyor_state_id == currentConveyorState &&
+      p.last_poop_counter == p.poopCounter) { 
+        return; 
+  }
+
+  p.last_statusText = p.statusText; 
+  p.last_mqttStatus = p.mqttStatus; 
+  p.last_color = p.color; 
+  p.last_name = p.name; 
+  p.last_progress = p.progress;
+  p.last_conveyor_state_id = currentConveyorState;
+  p.last_poop_counter = p.poopCounter;
+
+  tft.setTextSize(1); 
+  int w = 150; int h = 95; int x = (index % 2) * 160 + 5; int y = (index < 2) ? 40 : 140;
+  
+  tft.fillRoundRect(x, y, w, h, 8, UI_CARD_BG); tft.fillRoundRect(x+5, y+10, 6, h-20, 3, p.color);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(UI_TEXT_SUB, UI_CARD_BG); tft.drawString(p.name, x + 18, y + 10, 2); tft.drawString(p.ip, x + 18, y + 28, 1);   
+  tft.setTextColor(p.color, UI_CARD_BG); int font = (p.statusText.length() > 7) ? 2 : 4; tft.drawString(p.statusText, x + 18, y + 55, font);
+
+  if (p.mqttStatus == "OK" && p.statusText != "OFFLINE") {
+    drawProgressRing(x + w - 25, y + 25, 18, p.progress, p.color);
+  }
+
+  tft.setTextDatum(BL_DATUM);
+  tft.setTextColor(TFT_YELLOW, UI_CARD_BG);
+  tft.drawString("Bin: " + String(p.poopCounter) + "/" + String(p.poopTarget), x + 18, y + h - 5, 2);
+
+  if (activePrinterIndex == index && conveyorState != STATE_IDLE) {
+     tft.setTextDatum(MC_DATUM);
+     tft.setTextColor(TFT_GREEN, UI_CARD_BG);
+     String motorMsg = (conveyorState == STATE_RUNNING) ? "MOTOR ON" : "WAITING";
+     tft.drawString(motorMsg, x + w/2, y + h - 15, 2);
+  } else {
+     tft.setTextDatum(BR_DATUM); uint16_t mCol = (p.mqttStatus == "OK") ? palette[1] : palette[0]; tft.setTextColor(mCol, UI_CARD_BG); tft.drawString(p.mqttStatus == "OK" ? "MQTT" : "NO SIG", x + w - 5, y + h - 5, 1); tft.setTextDatum(TL_DATUM);
+  }
+}
+
+void forceUpdateAllBoxes() { for(int i=0; i<4; i++) { printers[i].last_statusText = ""; updatePrinterBox(i); } }
+
+void drawMainScreen() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.fillRoundRect(0, 0, 320, 35, 0, UI_BG); tft.setTextColor(UI_TEXT_MAIN, UI_BG); tft.setTextDatum(ML_DATUM); tft.drawString("Conveyor System", 10, 17, 2);
+  tft.fillCircle(145, 17, 5, palette[0]); lastWifiConnected = false; 
+  drawBtn(160, 5, 75, 26, "CALIB", UI_CARD_BG, UI_TEXT_MAIN); drawBtn(240, 5, 75, 26, "SETUP", UI_ACCENT, UI_TEXT_MAIN);
+  tft.setTextDatum(TL_DATUM); forceUpdateAllBoxes();
+}
+
+void drawMenuHub() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_MAIN, UI_BG); tft.setTextDatum(TC_DATUM); tft.drawString("SETTINGS", 160, 5, 4); tft.setTextDatum(TL_DATUM);
+  int bw = 140; int bh = 70; int gap = 15; int startX = 15; int startY = 40;
+  drawBtn(startX, startY, bw, bh, "NETWORK", 0x4A69); drawBtn(startX+bw+gap, startY, bw, bh, "MOTORS", 0xE308);
+  drawBtn(startX, startY+bh+gap, bw, bh, "COLORS", 0x9932); drawBtn(startX+bw+gap, startY+bh+gap, bw, bh, "DISPLAY", 0xD405);
+  drawBtn(240, 5, 75, 30, "BACK", palette[0], UI_TEXT_MAIN);
+}
+
+void drawSetupNetwork() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("Network Setup", 10, 5, 2); drawBtn(240, 5, 75, 30, "BACK", palette[0]);
+  int y = 50; drawBtn(10, y, 300, 40, "SSID: " + wifi_ssid, UI_CARD_BG, UI_TEXT_MAIN); y+=50; drawBtn(10, y, 300, 40, "PASS: ****", UI_CARD_BG, UI_TEXT_MAIN);
+}
+
+void drawSetupMotors() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("Motor Setup", 10, 5, 2); drawBtn(240, 5, 75, 30, "BACK", palette[0]);
+  int y = 45; tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("M2 (Secondary) Setup:", 10, y, 1); y+=15;
+  drawBtn(10, y, 145, 35, "M2 Del: " + String(delay_m2_sec), UI_CARD_BG, UI_TEXT_MAIN); drawBtn(165, y, 145, 35, "M2 Run: " + String(duration_m2_sec), UI_CARD_BG, UI_TEXT_MAIN); y+=45;
+  tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("Control:", 10, y, 1); y+=15;
+  uint16_t linkColor = m2_auto_link ? palette[1] : palette[0]; uint16_t linkTxt = m2_auto_link ? TFT_BLACK : TFT_WHITE;
+  drawBtn(10, y, 300, 35, "M2 AUTO LINK: " + String(m2_auto_link ? "ON" : "OFF"), linkColor, linkTxt); y+=45;
+  bool s1 = (digitalRead(RELAY1_PIN) == RELAY_ON); bool s2 = (digitalRead(RELAY2_PIN) == RELAY_ON);
+  drawBtn(50, y, 100, 40, "TEST M1", s1?palette[1]:palette[0], s1?TFT_BLACK:TFT_WHITE); drawBtn(170, y, 100, 40, "TEST M2", s2?palette[1]:palette[0], s2?TFT_BLACK:TFT_WHITE);
+}
+
+void drawSetupColors() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("Colors Setup", 10, 5, 2); drawBtn(240, 5, 75, 30, "BACK", palette[0]);
+  int y = 50; drawBtn(10, y, 145, 40, "OK / RDY", palette[idx_col_ok], TFT_BLACK); drawBtn(165, y, 145, 40, "ERR / OFF", palette[idx_col_err], TFT_BLACK); y+=50;
+  drawBtn(10, y, 300, 40, "ACTION / POOP", palette[idx_col_act], TFT_BLACK);
+}
+
+void drawSetupDisplay() {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_SUB, UI_BG); tft.drawString("Display Setup", 10, 5, 2); drawBtn(240, 5, 75, 30, "BACK", palette[0]);
+  int y = 80; tft.setTextColor(UI_TEXT_MAIN, UI_BG); tft.drawString("Sleep Timeout:", 20, y, 4); drawBtn(220, y-5, 80, 40, String(sleep_timeout), UI_CARD_BG, UI_TEXT_MAIN); y+=60;
+  tft.drawString("Unit:", 20, y, 4); drawBtn(220, y-5, 80, 40, sleep_in_minutes ? "MIN" : "SEC", UI_ACCENT, UI_TEXT_MAIN);
+}
+
+void drawPrinterSettings(int index) {
+  tft.setTextSize(1); tft.fillScreen(UI_BG); tft.setTextColor(UI_TEXT_MAIN, UI_BG); tft.drawString("Printer " + String(index+1), 10, 5, 2); drawBtn(240, 5, 75, 30, "BACK", palette[0]);
+  int y = 40; int h = 30; int gap = 35; 
+  drawBtn(10, y, 300, h, "Name: " + printers[index].name, UI_CARD_BG); y+=gap;
+  drawBtn(10, y, 300, h, "IP: " + printers[index].ip, UI_CARD_BG); y+=gap;
+  drawBtn(10, y, 300, h, "Code: " + printers[index].accessCode, UI_CARD_BG); y+=gap;
+  drawBtn(10, y, 300, h, "SN: " + printers[index].serial, UI_CARD_BG); y+=gap; 
+  
+  drawBtn(10, y, 145, h, "Start Del(s): " + String(printers[index].delayStartSec), UI_CARD_BG);
+  drawBtn(165, y, 145, h, "Run Time(s): " + String(printers[index].runTimeSec), UI_CARD_BG);
+  y+=35;
+  
+  int btnW = 95; 
+  int gapX = 5;
+  int startX = 10;
+  
+  drawBtn(startX, y, btnW, 35, "Lmt: " + String(printers[index].poopTarget), UI_CARD_BG, UI_TEXT_MAIN);
+  uint16_t c1 = printers[index].useM1 ? palette[idx_col_ok] : palette[idx_col_err];
+  drawBtn(startX + btnW + gapX, y, btnW, 35, printers[index].useM1 ? "M1: ON" : "M1: OFF", c1, TFT_BLACK);
+  uint16_t c2 = printers[index].useM2 ? palette[idx_col_ok] : palette[idx_col_err];
+  drawBtn(startX + 2*btnW + 2*gapX, y, btnW, 35, printers[index].useM2 ? "M2: ON" : "M2: OFF", c2, TFT_BLACK);
+}
+
+void drawKeyboard(bool fullRedraw) { 
+  if (fullRedraw) {
+    tft.setTextSize(1); tft.fillScreen(ANDROID_BG); 
+    int btnH = 35; tft.fillRoundRect(5, 5, 50, btnH, 6, ANDROID_DEL); tft.setTextColor(TFT_WHITE, ANDROID_DEL); tft.setTextDatum(MC_DATUM); tft.drawString("ESC", 30, 5 + btnH/2, 2);
+    tft.setTextColor(ANDROID_TEXT, ANDROID_BG); tft.setTextDatum(MC_DATUM); tft.drawString(keyboardTitle, 160, 5 + btnH/2, 2);
+    tft.fillRoundRect(265, 5, 50, btnH, 6, ANDROID_ACCENT); tft.setTextColor(TFT_WHITE, ANDROID_ACCENT); tft.setTextDatum(MC_DATUM); tft.drawString("OK", 290, 5 + btnH/2, 2);
+    
+    int startY = 85; int w = 28; int h = 28; int gapX = 4; int gapY = 4;
+    const char* (*currentKeys)[10]; if(keyboardMode == 0) currentKeys = keysLower; else if(keyboardMode == 1) currentKeys = keysUpper; else if(keyboardMode == 2) currentKeys = keysSym; else currentKeys = keysLower;
+    tft.setTextDatum(MC_DATUM);
+    for(int r=0; r<4; r++) { for(int c=0; c<10; c++) { int kx = 2 + c*(w+gapX); int ky = startY + r*(h+gapY); tft.fillRoundRect(kx, ky, w, h, 5, ANDROID_KEY); tft.setTextColor(ANDROID_TEXT, ANDROID_KEY); tft.drawString(currentKeys[r][c], kx + w/2, ky + h/2, 2); } } 
+    
+    int yRow5 = startY + 4*(h+gapY) + 5; int fh = 32; String shiftLabel = (keyboardMode == 1) ? "abc" : "ABC";
+    
+    tft.fillRoundRect(2, yRow5, 40, fh, 6, ANDROID_KEY_P); tft.setTextColor(ANDROID_TEXT, ANDROID_KEY_P); tft.drawString(shiftLabel, 22, yRow5 + fh/2, 1);
+    tft.fillRoundRect(46, yRow5, 40, fh, 6, ANDROID_KEY_P); tft.setTextColor(ANDROID_TEXT, ANDROID_KEY_P); tft.drawString("?123", 66, yRow5 + fh/2, 1);
+    tft.fillRoundRect(90, yRow5, 140, fh, 6, ANDROID_KEY); tft.setTextColor(ANDROID_TEXT, ANDROID_KEY); tft.drawString("SPACE", 160, yRow5 + fh/2, 1);
+    tft.fillRoundRect(234, yRow5, 84, fh, 6, ANDROID_DEL); tft.setTextColor(TFT_WHITE, ANDROID_DEL); tft.drawString("DEL", 276, yRow5 + fh/2, 2);
+  }
+  tft.fillRoundRect(5, 45, 310, 35, 4, UI_CARD_BG); 
+  tft.drawRoundRect(5, 45, 310, 35, 4, ANDROID_SUB); 
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(ANDROID_TEXT, UI_CARD_BG); 
+  tft.drawString(keyboardBuffer, 10, 62, 2);
+  int cursorX = 10 + tft.textWidth(keyboardBuffer, 2); if(cursorX < 305) tft.drawLine(cursorX, 50, cursorX, 75, ANDROID_ACCENT);
+  tft.setTextDatum(TL_DATUM); 
+}
+
+void openKeyboard(String &var, String title) { keyboardTargetVariable = &var; keyboardTargetInt = nullptr; keyboardBuffer = var; keyboardTitle = title; keyboardMode = 0; currentScreen = SCREEN_KEYBOARD; drawKeyboard(true); }
+void openNumKeyboard(int &var, String title) { keyboardTargetInt = &var; keyboardTargetVariable = nullptr; keyboardBuffer = String(var); keyboardTitle = title; keyboardMode = 2; currentScreen = SCREEN_KEYBOARD; drawKeyboard(true); }
+
+void handleKeyboardInput(int x, int y) { 
+  if(y < 40) { 
+    if(x < 60) {
+      if (keyboardTitle.indexOf("WiFi") >= 0) { currentScreen = SCREEN_SETUP_NETWORK; drawSetupNetwork(); } 
+      else if (keyboardTitle.indexOf("Sleep") >= 0) { currentScreen = SCREEN_SETUP_DISPLAY; drawSetupDisplay(); } 
+      else if (keyboardTitle.indexOf("Delay") >= 0 || keyboardTitle.indexOf("Run") >= 0 || keyboardTitle.indexOf("Limit") >= 0 || keyboardTitle.indexOf("Lmt") >= 0) { currentScreen = SCREEN_SETUP_MOTORS; drawSetupMotors(); } 
+      else { currentScreen = SCREEN_PRINTER_SETTINGS; drawPrinterSettings(editingPrinterIndex); } 
+      return;
+    }
+    if(x > 260) {
+      if (keyboardTargetVariable != nullptr) *keyboardTargetVariable = keyboardBuffer; 
+      if (keyboardTargetInt != nullptr) *keyboardTargetInt = keyboardBuffer.toInt(); 
+      savePreferences(); 
+      if (keyboardTitle.indexOf("WiFi") >= 0) { currentScreen = SCREEN_SETUP_NETWORK; drawSetupNetwork(); } 
+      else if (keyboardTitle.indexOf("Sleep") >= 0) { currentScreen = SCREEN_SETUP_DISPLAY; drawSetupDisplay(); } 
+      else if (keyboardTitle.indexOf("Delay") >= 0 || keyboardTitle.indexOf("Run") >= 0 || keyboardTitle.indexOf("Limit") >= 0 || keyboardTitle.indexOf("Lmt") >= 0) { currentScreen = SCREEN_SETUP_MOTORS; drawSetupMotors(); } 
+      else { currentScreen = SCREEN_PRINTER_SETTINGS; drawPrinterSettings(editingPrinterIndex); } 
+      return;
+    }
+  }
+
+  int startY = 85; int w = 28; int h = 28; int gapX = 4; int gapY = 4;
+  if (y >= startY && y <= startY + 4*(h+gapY)) {
+    int r = (y - startY) / (h + gapY);
+    int c = (x - 2) / (w + gapX);
+    if (r >= 0 && r < 4 && c >= 0 && c < 10) {
+      const char* (*currentKeys)[10];
+      if(keyboardMode == 0) currentKeys = keysLower;
+      else if(keyboardMode == 1) currentKeys = keysUpper;
+      else currentKeys = keysSym;
+      keyboardBuffer += currentKeys[r][c];
+      drawKeyboard(false);
+      return;
+    }
+  }
+
+  int yRow5 = startY + 4*(h+gapY) + 5;
+  if (y >= yRow5 && y <= yRow5 + 32) {
+    if (x >= 2 && x <= 42) { keyboardMode = (keyboardMode == 1) ? 0 : 1; drawKeyboard(true); }
+    else if (x >= 46 && x <= 86) { keyboardMode = (keyboardMode == 2) ? 0 : 2; drawKeyboard(true); }
+    else if (x >= 90 && x <= 230) { keyboardBuffer += " "; drawKeyboard(false); }
+    else if (x >= 234 && x <= 318) {
+      if (keyboardBuffer.length() > 0) { keyboardBuffer.remove(keyboardBuffer.length() - 1); drawKeyboard(false); }
+    }
+  }
+}
+
+// =================================================================================
+// === 8. HANDLE TOUCH / OVLÁDÁNÍ DOTYKEM ===
+// =================================================================================
+
+void handleTouch(int x, int y) {
+  last_interaction = millis();
+
+  if (currentScreen == SCREEN_KEYBOARD) {
+    handleKeyboardInput(x, y);
+    return;
+  }
+
+  if (currentScreen == SCREEN_MAIN) {
+    if (y < 35) {
+      if (x >= 160 && x < 235) { runCalibrationProcedure(); drawMainScreen(); }
+      else if (x >= 240) { currentScreen = SCREEN_MENU_HUB; drawMenuHub(); }
+      return;
+    }
+    for (int i = 0; i < 4; i++) {
+      int bx = (i % 2) * 160 + 5;
+      int by = (i < 2) ? 40 : 140;
+      if (x >= bx && x <= bx + 150 && y >= by && y <= by + 95) {
+        editingPrinterIndex = i;
+        currentScreen = SCREEN_PRINTER_SETTINGS;
+        drawPrinterSettings(editingPrinterIndex);
+        return;
+      }
+    }
+  } 
+  else if (currentScreen == SCREEN_MENU_HUB) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MAIN; drawMainScreen(); return; }
+    if (x >= 15 && x <= 155 && y >= 40 && y <= 110) { currentScreen = SCREEN_SETUP_NETWORK; drawSetupNetwork(); }
+    else if (x >= 170 && x <= 310 && y >= 40 && y <= 110) { currentScreen = SCREEN_SETUP_MOTORS; drawSetupMotors(); }
+    else if (x >= 15 && x <= 155 && y >= 125 && y <= 195) { currentScreen = SCREEN_SETUP_COLORS; drawSetupColors(); }
+    else if (x >= 170 && x <= 310 && y >= 125 && y <= 195) { currentScreen = SCREEN_SETUP_DISPLAY; drawSetupDisplay(); }
+  }
+  else if (currentScreen == SCREEN_SETUP_NETWORK) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MENU_HUB; drawMenuHub(); return; }
+    if (y >= 50 && y <= 90) { openKeyboard(wifi_ssid, "WiFi SSID"); }
+    else if (y >= 100 && y <= 140) { openKeyboard(wifi_pass, "WiFi Password"); }
+  }
+  else if (currentScreen == SCREEN_SETUP_MOTORS) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MENU_HUB; drawMenuHub(); return; }
+    if (y >= 60 && y <= 95) {
+      if (x < 155) openNumKeyboard(delay_m2_sec, "M2 Delay (s)");
+      else openNumKeyboard(duration_m2_sec, "M2 Duration (s)");
+    }
+    else if (y >= 120 && y <= 155) {
+      m2_auto_link = !m2_auto_link;
+      saveM2Link();
+      drawSetupMotors();
+    }
+    else if (y >= 180 && y <= 220) {
+      if (x >= 50 && x <= 150) {
+        digitalWrite(RELAY1_PIN, digitalRead(RELAY1_PIN) == RELAY_ON ? RELAY_OFF : RELAY_ON);
+        drawSetupMotors();
+      } else if (x >= 170 && x <= 270) {
+        digitalWrite(RELAY2_PIN, digitalRead(RELAY2_PIN) == RELAY_ON ? RELAY_OFF : RELAY_ON);
+        drawSetupMotors();
+      }
+    }
+  }
+  else if (currentScreen == SCREEN_SETUP_COLORS) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MENU_HUB; drawMenuHub(); return; }
+    if (y >= 50 && y <= 90) {
+      if (x < 155) { idx_col_ok = (idx_col_ok + 1) % palette_len; savePreferences(); drawSetupColors(); }
+      else { idx_col_err = (idx_col_err + 1) % palette_len; savePreferences(); drawSetupColors(); }
+    } else if (y >= 100 && y <= 140) {
+      idx_col_act = (idx_col_act + 1) % palette_len; savePreferences(); drawSetupColors();
+    }
+  }
+  else if (currentScreen == SCREEN_SETUP_DISPLAY) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MENU_HUB; drawMenuHub(); return; }
+    if (y >= 75 && y <= 115) { openNumKeyboard(sleep_timeout, "Sleep Timeout"); }
+    else if (y >= 135 && y <= 175) {
+      sleep_in_minutes = !sleep_in_minutes;
+      savePreferences();
+      drawSetupDisplay();
+    }
+  }
+  else if (currentScreen == SCREEN_PRINTER_SETTINGS) {
+    if (y < 40 && x > 240) { currentScreen = SCREEN_MAIN; drawMainScreen(); return; }
+    int p = editingPrinterIndex;
+    if (y >= 40 && y <= 70) openKeyboard(printers[p].name, "Printer Name");
+    else if (y >= 75 && y <= 105) openKeyboard(printers[p].ip, "Printer IP");
+    else if (y >= 110 && y <= 140) openKeyboard(printers[p].accessCode, "Access Code");
+    else if (y >= 145 && y <= 175) openKeyboard(printers[p].serial, "Serial Number");
+    else if (y >= 180 && y <= 210) {
+      if (x < 155) openNumKeyboard(printers[p].delayStartSec, "Start Delay (s)");
+      else openNumKeyboard(printers[p].runTimeSec, "Run Time (s)");
+    }
+    else if (y >= 215 && y <= 250) {
+      if (x < 105) openNumKeyboard(printers[p].poopTarget, "Poop Limit");
+      else if (x >= 110 && x <= 205) { printers[p].useM1 = !printers[p].useM1; savePreferences(); drawPrinterSettings(p); }
+      else if (x >= 210) { printers[p].useM2 = !printers[p].useM2; savePreferences(); drawPrinterSettings(p); }
+    }
+  }
+}
+
+// =================================================================================
+// === 9. SETUP & LOOP ===
+// =================================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(CYD_BACKLIGHT, OUTPUT);
+  digitalWrite(RELAY1_PIN, RELAY_OFF);
+  digitalWrite(RELAY2_PIN, RELAY_OFF);
+  digitalWrite(CYD_BACKLIGHT, HIGH);
+
+  // Samostatná SPI sběrnice pro dotykový čip XPT2046
+  touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(touchSpi);
+  ts.setRotation(1);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  loadPreferences();
+  loadCalibration();
+
+  WiFi.mode(WIFI_STA);
+
+  drawMainScreen();
+
+  xTaskCreatePinnedToCore(
+    networkLoop,
+    "NetworkTask",
+    10000,
+    NULL,
+    1,
+    &NetworkTask,
+    0
+  );
+
+  last_interaction = millis();
+}
+
+void loop() {
+  checkConveyorLogic();
+  checkSleep();
+  updateWifiStatusUI();
+
+  int touchX = 0, touchY = 0;
+  if (isTouched(touchX, touchY)) {
+    handleTouch(touchX, touchY);
+    delay(150); 
+  }
+
+  if (currentScreen == SCREEN_MAIN) {
+    for (int i = 0; i < 4; i++) {
+      updatePrinterBox(i);
+    }
+  }
+
+  delay(10);
+}
